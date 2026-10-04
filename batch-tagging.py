@@ -1,17 +1,33 @@
+import argparse
+import csv
 import json
 import os
 import sys
+import time
+from datetime import datetime
+
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # TAG_ID = "jU3ZsuQekszxvCkHQiV7l9i9jSzq-01"  # windows11 tag (now chosen from a menu at startup)
-CSV_FILE = "devices.csv"  # Change this to your CSV filename
-MAX_WORKERS = 10  # Number of parallel API requests
+CSV_FILE = "devices.csv"  # Default input file, override with --csv
+DEVICE_PAGE_SIZE = 1000  # Devices per page when listing attackSurfaceDevices
+TAG_BATCH_SIZE = 1000  # Max mappings per tag assign request
+MAX_RETRIES = 6  # Retries for 429 / 5xx / network errors before giving up
+OUTPUT_ROOT = "output"  # Each run writes its result files to output/<timestamp>/
 
 url_base = 'https://api.xdr.trendmicro.com'
 device_api_path = '/v3.0/asrm/attackSurfaceDevices'
 tag_api_path = '/v3.0/tagManagement/customTags/assign'
 tag_list_api_path = '/v3.0/tagManagement/customTags'
+
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+HEADER_NAMES = {'devicename', 'device name', 'name', 'hostname', 'device'}
+
+parser = argparse.ArgumentParser(description='Assign a Vision One custom tag to devices listed in a CSV file.')
+parser.add_argument('--csv', default=CSV_FILE, help=f'file of device names, one per line (default: {CSV_FILE})')
+parser.add_argument('--dry-run', action='store_true', help='match devices and write result files, but do not assign the tag')
+parser.add_argument('--limit', type=int, help='only use the first N names from the CSV (for testing on a sample)')
+args = parser.parse_args()
 
 token = os.environ.get('TMV1_TOKEN')
 if not token:
@@ -22,6 +38,52 @@ headers = {
     'Content-Type': 'application/json;charset=utf-8'
 }
 
+session = requests.Session()
+session.headers.update(headers)
+
+
+def request_with_retry(method, url, **kwargs):
+    """Send a request, retrying on rate limits, server errors and network errors.
+
+    Waits for Retry-After when the API sends it, otherwise backs off exponentially.
+    Returns the final response (which may still be an error status) or raises the
+    last network error once retries run out.
+    """
+    kwargs.setdefault('timeout', 60)
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            r = session.request(method, url, **kwargs)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            if attempt == MAX_RETRIES:
+                raise
+            wait = min(2 ** attempt * 2, 60)
+            print(f'  … {type(e).__name__}, retrying in {wait}s ({attempt + 1}/{MAX_RETRIES})')
+            time.sleep(wait)
+            continue
+
+        if r.status_code not in RETRY_STATUSES or attempt == MAX_RETRIES:
+            return r
+
+        retry_after = r.headers.get('Retry-After', '')
+        wait = int(retry_after) if retry_after.isdigit() else min(2 ** attempt * 2, 60)
+        print(f'  … HTTP {r.status_code}, retrying in {wait}s ({attempt + 1}/{MAX_RETRIES})')
+        time.sleep(wait)
+
+
+def describe_error(e):
+    """Short, readable description of a request failure"""
+    if isinstance(e, requests.exceptions.HTTPError) and e.response is not None:
+        return f'HTTP {e.response.status_code} {e.response.reason}'
+    return f'{type(e).__name__}: {e}'
+
+
+def write_csv(path, header, rows):
+    with open(path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
 # Step 0: Fetch available custom tags and let the user pick one
 def fetch_tags():
     """Fetch all custom tags, following nextLink pagination"""
@@ -29,7 +91,7 @@ def fetch_tags():
     url = url_base + tag_list_api_path
     params = {'top': 200}
     while url:
-        r = requests.get(url, headers=headers, params=params, timeout=30)
+        r = request_with_retry('GET', url, params=params)
         r.raise_for_status()
         data = r.json()
         tags.extend(data.get('items', []))
@@ -59,7 +121,7 @@ print('Fetching available tags...')
 try:
     tags = fetch_tags()
 except requests.exceptions.RequestException as e:
-    sys.exit(f'Failed to fetch tags: {e}')
+    sys.exit(f'Failed to fetch tags: {describe_error(e)}')
 if not tags:
     sys.exit('No custom tags found')
 
@@ -68,155 +130,171 @@ TAG_ID = selected_tag['id']
 TAG_LABEL = f'{selected_tag.get("property", "")}: {selected_tag.get("value", "")}'
 print(f'Selected tag: {TAG_LABEL} ({TAG_ID})\n')
 
-# Step 1: Read device names from CSV file
-print(f'Reading device names from {CSV_FILE}...')
-names_to_tag = []
+# Step 1: Read device names from CSV file (first column; header row and duplicates skipped)
+print(f'Reading device names from {args.csv}...')
+names_to_tag = {}  # lowercase name -> name as written in the CSV
 try:
-    with open(CSV_FILE, 'r') as f:
-        for line in f:
-            name = line.strip()
-            if name:  # Skip empty lines
-                names_to_tag.append(name)
+    with open(args.csv, 'r', newline='') as f:
+        for i, row in enumerate(csv.reader(f)):
+            name = row[0].strip() if row else ''
+            if not name:
+                continue
+            if i == 0 and name.lower() in HEADER_NAMES:
+                continue
+            names_to_tag.setdefault(name.lower(), name)
 except FileNotFoundError:
-    sys.exit(f'CSV file not found: {CSV_FILE}')
+    sys.exit(f'CSV file not found: {args.csv}')
 
-print(f'Found {len(names_to_tag)} device names to tag\n')
+if args.limit:
+    names_to_tag = dict(list(names_to_tag.items())[:args.limit])
+if not names_to_tag:
+    sys.exit('No device names found in the CSV file')
 
-# Step 2: Search for each device using filter (parallel)
-print(f'Searching for devices (using {MAX_WORKERS} parallel workers)...')
-matched_devices = []
-not_found = []
-errors = []  # (device_name, error message) for lookups that failed, as opposed to not found
+print(f'Found {len(names_to_tag)} unique device names to tag')
+if args.dry_run:
+    print('DRY RUN: devices will be matched but the tag will NOT be assigned')
 
-def search_device(device_name):
-    """Search for a single device by name using filter.
+run_dir = os.path.join(OUTPUT_ROOT, datetime.now().strftime('%Y%m%d-%H%M%S'))
+os.makedirs(run_dir, exist_ok=True)
+print(f'Writing results to {run_dir}/\n')
 
-    Returns the matched device, or None if the API returned no exact match.
-    Raises on request/HTTP errors so they aren't mistaken for "not found".
-    """
-    # Use filter parameter with proper formatting
-    filter_param = f"deviceName eq '{device_name}'"
-    query_params = {'filter': filter_param}
+# Results, filled in as the run goes
+matched = []  # (csv name, deviceName, assetId)
+matched_names = set()  # lowercase names that matched at least one device
+pending = []  # matched devices waiting for the next tag batch
+tagged = []  # (csv name, deviceName, assetId, batch number, status)
+tag_errors = []  # (csv name, deviceName, assetId, error)
+operations = []  # (batch number, Operation-Location)
+batch_count = 0
+listing_complete = False
+listing_error = None
+interrupted = False
 
-    r = requests.get(url_base + device_api_path, params=query_params, headers=headers, timeout=30)
-    r.raise_for_status()
 
-    data = r.json()
-    items = data.get('items', [])
+def flush_batch():
+    """Assign the tag to everything in `pending` in one request"""
+    global batch_count
+    if not pending:
+        return
+    batch = pending[:]
+    pending.clear()
+    batch_count += 1
 
-    # Match the exact device name (case-insensitive)
-    for device in items:
-        if device.get('deviceName', '').lower() == device_name.lower():
-            return {
-                'assetId': device.get('id'),
-                'deviceName': device.get('deviceName', device_name)
+    if args.dry_run:
+        tagged.extend((n, d, a, batch_count, 'dry-run') for n, d, a in batch)
+        print(f'  Batch {batch_count}: {len(batch)} devices (dry run, not sent)')
+        return
+
+    body = {
+        'assignments': [
+            {
+                'assetType': 'device',
+                'mappings': [{'tagId': TAG_ID, 'assetId': a} for _, _, a in batch]
             }
+        ]
+    }
+    try:
+        r = request_with_retry('POST', url_base + tag_api_path, json=body)
+    except requests.exceptions.RequestException as e:
+        tag_errors.extend((n, d, a, describe_error(e)) for n, d, a in batch)
+        print(f'  Batch {batch_count}: ✗ Failed - {describe_error(e)}')
+        return
 
-    return None
+    if 200 <= r.status_code < 300:
+        tagged.extend((n, d, a, batch_count, r.status_code) for n, d, a in batch)
+        print(f'  Batch {batch_count}: ✓ {len(batch)} devices, status {r.status_code}')
+        if 'Operation-Location' in r.headers:
+            operations.append((batch_count, r.headers['Operation-Location']))
+    else:
+        message = f'HTTP {r.status_code}'
+        if 'application/json' in r.headers.get('Content-Type', ''):
+            message += ' ' + json.dumps(r.json())
+        tag_errors.extend((n, d, a, message) for n, d, a in batch)
+        print(f'  Batch {batch_count}: ✗ {message}')
 
-def describe_error(e):
-    """Short, readable description of a lookup failure"""
-    if isinstance(e, requests.exceptions.HTTPError) and e.response is not None:
-        return f'HTTP {e.response.status_code} {e.response.reason}'
-    return f'{type(e).__name__}: {e}'
 
-# Use ThreadPoolExecutor for parallel searches
-with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    futures = {executor.submit(search_device, name): name for name in names_to_tag}
+# Step 2: List all devices once and match locally, tagging each full batch as it fills
+print('Scanning devices and assigning the tag as matches are found...')
+start = time.time()
+scanned = 0
+url = url_base + device_api_path
+params = {'top': DEVICE_PAGE_SIZE}
+try:
+    while url:
+        r = request_with_retry('GET', url, params=params)
+        r.raise_for_status()
+        data = r.json()
+        url = data.get('nextLink')
+        params = None  # nextLink already carries the query string
 
-    completed = 0
-    for future in as_completed(futures):
-        completed += 1
-        device_name = futures[future]
-        try:
-            result = future.result()
-            if result:
-                matched_devices.append(result)
-                print(f'[{completed}/{len(names_to_tag)}] ✓ Found: {device_name}')
-            else:
-                not_found.append(device_name)
-                print(f'[{completed}/{len(names_to_tag)}] ✗ Not found: {device_name}')
-        except Exception as e:
-            errors.append((device_name, describe_error(e)))
-            print(f'[{completed}/{len(names_to_tag)}] ! Error: {device_name} ({describe_error(e)})')
+        for device in data.get('items', []):
+            scanned += 1
+            key = device.get('deviceName', '').lower()
+            if key in names_to_tag:
+                entry = (names_to_tag[key], device.get('deviceName'), device.get('id'))
+                matched.append(entry)
+                matched_names.add(key)
+                pending.append(entry)
+                if len(pending) >= TAG_BATCH_SIZE:
+                    flush_batch()
 
+        print(f'  Scanned {scanned} devices, matched {len(matched_names)}/{len(names_to_tag)} names '
+              f'({time.time() - start:.0f}s)')
+    listing_complete = True
+except requests.exceptions.RequestException as e:
+    listing_error = describe_error(e)
+    print(f'\n✗ Device listing stopped: {listing_error}')
+except KeyboardInterrupt:
+    interrupted = True
+    print('\n✗ Interrupted, sending matches found so far...')
+finally:
+    # Tag whatever matched before the listing ended, unless the user pressed Ctrl+C again
+    try:
+        flush_batch()
+    except KeyboardInterrupt:
+        interrupted = True
+        tag_errors.extend((n, d, a, 'interrupted, not submitted') for n, d, a in pending)
+        pending.clear()
+
+# Step 3: Write result files
+unmatched = [names_to_tag[k] for k in names_to_tag if k not in matched_names]
+write_csv(os.path.join(run_dir, 'matched.csv'), ['csvName', 'deviceName', 'assetId'], matched)
+write_csv(os.path.join(run_dir, 'tagged.csv'), ['csvName', 'deviceName', 'assetId', 'batch', 'status'], tagged)
+if tag_errors:
+    write_csv(os.path.join(run_dir, 'tag_errors.csv'), ['csvName', 'deviceName', 'assetId', 'error'], tag_errors)
+if operations:
+    write_csv(os.path.join(run_dir, 'operations.csv'), ['batch', 'operationLocation'], operations)
+# Names the scan never reached are "unresolved", not "not found": they may still exist
+unmatched_file = 'not_found.csv' if listing_complete else 'unresolved.csv'
+if unmatched:
+    with open(os.path.join(run_dir, unmatched_file), 'w', newline='') as f:
+        csv.writer(f).writerows([n] for n in unmatched)
+# Names whose tag request failed, in the same format as the input so they can be re-run
+if tag_errors:
+    with open(os.path.join(run_dir, 'retry.csv'), 'w', newline='') as f:
+        csv.writer(f).writerows([n] for n in dict.fromkeys(n for n, _, _, _ in tag_errors))
+
+# Summary
+duplicates = len(matched) - len(matched_names)
 print(f'\n{"="*60}')
-print(f'Results: Matched {len(matched_devices)}/{len(names_to_tag)} devices')
-if errors:
-    print(f'         {len(errors)} lookups failed with errors (not the same as not found)')
-print(f'{"="*60}\n')
+print(f'Tag:        {TAG_LABEL} ({TAG_ID})')
+print(f'Scanned:    {scanned} devices{"" if listing_complete else " (scan did not finish)"}')
+print(f'Matched:    {len(matched_names)}/{len(names_to_tag)} names, {len(matched)} devices'
+      + (f' ({duplicates} extra devices share a name)' if duplicates else ''))
+print(f'{"Would tag:" if args.dry_run else "Tagged:":<11} {len(tagged)} devices in {batch_count} batches')
+if tag_errors:
+    print(f'Failed:     {len(tag_errors)} devices → retry.csv, tag_errors.csv')
+if unmatched:
+    label = 'Not found' if listing_complete else 'Unresolved'
+    print(f'{label + ":":<11} {len(unmatched)} names → {unmatched_file}')
+print(f'Results:    {run_dir}/')
+print(f'{"="*60}')
 
-if matched_devices:
-    print('Matched devices:')
-    for device in matched_devices[:10]:
-        print(f'  • {device["deviceName"]} ({device["assetId"]})')
-    if len(matched_devices) > 10:
-        print(f'  ... and {len(matched_devices) - 10} more')
+if not listing_complete:
+    print('\nThe device scan did not finish, so some names were never checked.')
+    print(f'Re-run them with:  python3 batch-tagging.py --csv {os.path.join(run_dir, unmatched_file)}')
+if tag_errors:
+    print(f'\nRe-run failed tag batches with:  python3 batch-tagging.py --csv {os.path.join(run_dir, "retry.csv")}')
 
-# Step 3: Assign tags in batches (max 1000 per request)
-if matched_devices:
-    print(f'\nAssigning tag "{TAG_LABEL}" ({TAG_ID}) to {len(matched_devices)} devices...')
-    print('-' * 60)
-
-    batch_size = 1000
-    total_assigned = 0
-
-    for batch_num in range(0, len(matched_devices), batch_size):
-        batch = matched_devices[batch_num:batch_num+batch_size]
-
-        body = {
-            'assignments': [
-                {
-                    'assetType': 'device',
-                    'mappings': [
-                        {
-                            'tagId': TAG_ID,
-                            'assetId': device['assetId']
-                        }
-                        for device in batch
-                    ]
-                }
-            ]
-        }
-
-        try:
-            r = requests.post(url_base + tag_api_path, headers=headers, json=body, timeout=30)
-
-            if r.status_code == 202:  # Accepted (async)
-                total_assigned += len(batch)
-                print(f'Batch {batch_num//batch_size + 1}: ✓ Status {r.status_code} (Accepted)')
-                if 'Operation-Location' in r.headers:
-                    print(f'  → Poll: {r.headers["Operation-Location"]}\n')
-            elif r.status_code >= 200 and r.status_code < 300:
-                total_assigned += len(batch)
-                print(f'Batch {batch_num//batch_size + 1}: ✓ Status {r.status_code} (Success)\n')
-            else:
-                print(f'Batch {batch_num//batch_size + 1}: ✗ Status {r.status_code}')
-                if 'application/json' in r.headers.get('Content-Type', ''):
-                    print(f'  Error: {json.dumps(r.json(), indent=2)}\n')
-
-        except requests.exceptions.RequestException as e:
-            print(f'Batch {batch_num//batch_size + 1}: ✗ Failed - {e}\n')
-
-    print('='*60)
-    print(f'✓ Assignment complete! Tagged {total_assigned} devices')
-    print('='*60)
-
-elif errors:
-    print('✗ No devices matched. Lookups failed with errors, see below.')
-else:
-    print('✗ No devices matched. Check that device names are correct.')
-
-if not_found:
-    print(f'\n⚠️  {len(not_found)} devices not found in the system:')
-    for name in not_found[:10]:
-        print(f'  • {name}')
-    if len(not_found) > 10:
-        print(f'  ... and {len(not_found) - 10} more')
-
-if errors:
-    print(f'\n⚠️  {len(errors)} device lookups failed (these devices may exist, so re-run them):')
-    for name, message in errors[:10]:
-        print(f'  • {name}: {message}')
-    if len(errors) > 10:
-        print(f'  ... and {len(errors) - 10} more')
+if interrupted or listing_error or tag_errors:
+    sys.exit(1)
