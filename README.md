@@ -48,7 +48,7 @@ Assigns one custom tag to many devices at once, using a list of device names. Wi
 
 2. **Read device names** from the CSV file. Duplicate names are removed, ignoring case.
 
-3. **Scan all devices** in Attack Surface devices (`GET /v3.0/asrm/attackSurfaceDevices`), `DEVICE_PAGE_SIZE` devices per page, following `nextLink`. Each device is matched against the CSV names exactly, ignoring case. If several devices share a name, all of them are tagged.
+3. **Scan all devices** in Attack Surface devices (`GET /v3.0/asrm/attackSurfaceDevices`), `DEVICE_PAGE_SIZE` devices per page, following `nextLink`. Each CSV entry is matched exactly, ignoring case, against each device's `deviceName` and its IP addresses (`ip`, `ipAddress` or `ipAddresses`). Devices that Vision One knows only by IP, with no hostname, can therefore be listed by IP. If several devices share a name, all of them are tagged. If a device appears in the CSV by both name and IP, it's tagged once.
 
 4. **Assign the tag as it goes.** Every time 1000 devices have matched, the script sends them in one `POST /v3.0/tagManagement/customTags/assign` request. The last partial batch is sent when the scan ends, including when the scan fails or you press Ctrl+C, so work done so far isn't lost.
 
@@ -56,12 +56,13 @@ Every request is retried on `HTTP 429` (rate limited), `5xx` and network errors,
 
 ### Input file
 
-The CSV has one device name per line, in the first column. Blank lines are skipped, and so is a header row if the first line is `deviceName`, `name`, `hostname` or `device`.
+The CSV has one device name or IP address per line, in the first column. Names and IPs can be mixed in one file. Blank lines are skipped, and so is a header row if the first line is `deviceName`, `name`, `hostname`, `device` or `ip`.
 
 ```
 kebede-vm-02
 JSmith-PC
 LAPTOP-GRANGER0
+172.24.124.62
 ```
 
 ### Usage

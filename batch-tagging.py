@@ -22,7 +22,8 @@ tag_unassign_api_path = '/v3.0/tagManagement/customTags/unassign'
 tag_list_api_path = '/v3.0/tagManagement/customTags'
 
 RETRY_STATUSES = {429, 500, 502, 503, 504}
-HEADER_NAMES = {'devicename', 'device name', 'name', 'hostname', 'device'}
+HEADER_NAMES = {'devicename', 'device name', 'name', 'hostname', 'device', 'ip'}
+IP_FIELDS = ('ip', 'ipAddress', 'ipAddresses')  # device fields that may hold IP addresses
 
 parser = argparse.ArgumentParser(description='Assign (or remove) a Vision One custom tag for devices listed in a CSV file.')
 parser.add_argument('--csv', default=CSV_FILE, help=f'file of device names, one per line (default: {CSV_FILE})')
@@ -178,7 +179,8 @@ print(f'Writing results to {run_dir}/\n')
 
 # Results, filled in as the run goes
 matched = []  # (csv name, deviceName, assetId)
-matched_names = set()  # lowercase names that matched at least one device
+matched_names = set()  # lowercase names/IPs that matched at least one device
+duplicates = 0  # matched devices whose name/IP had already matched another device
 pending = []  # matched devices waiting for the next tag batch
 tagged = []  # (csv name, deviceName, assetId, batch number, status)
 tag_errors = []  # (csv name, deviceName, assetId, error)
@@ -231,6 +233,24 @@ def flush_batch():
         print(f'  Batch {batch_count}: ✗ {message}')
 
 
+def device_keys(device):
+    """Lowercase name and IP addresses a CSV entry can match for this device.
+
+    Devices discovered only by IP may have no deviceName (or a null one), so the
+    IP fields are matched too. Field names follow ASD.py.
+    """
+    keys = []
+    name = device.get('deviceName')
+    if name:
+        keys.append(name.strip().lower())
+    for field in IP_FIELDS:
+        value = device.get(field)
+        for ip in (value if isinstance(value, list) else [value]):
+            if isinstance(ip, str) and ip.strip():
+                keys.append(ip.strip().lower())
+    return keys
+
+
 # Step 2: List all devices once and match locally, tagging each full batch as it fills
 print(f'Scanning devices and {"removing" if args.remove else "assigning"} the tag as matches are found...')
 start = time.time()
@@ -247,11 +267,14 @@ try:
 
         for device in data.get('items', []):
             scanned += 1
-            key = device.get('deviceName', '').lower()
-            if key in names_to_tag:
-                entry = (names_to_tag[key], device.get('deviceName'), device.get('id'))
+            hits = [k for k in device_keys(device) if k in names_to_tag]
+            if hits:
+                # One entry per device, even if both its name and IP are in the CSV
+                entry = (names_to_tag[hits[0]], device.get('deviceName') or '', device.get('id'))
+                if all(k in matched_names for k in hits):
+                    duplicates += 1
                 matched.append(entry)
-                matched_names.add(key)
+                matched_names.update(hits)
                 pending.append(entry)
                 if len(pending) >= TAG_BATCH_SIZE:
                     flush_batch()
@@ -293,7 +316,6 @@ if tag_errors:
         csv.writer(f).writerows([n] for n in dict.fromkeys(n for n, _, _, _ in tag_errors))
 
 # Summary
-duplicates = len(matched) - len(matched_names)
 print(f'\n{"="*60}')
 print(f'Tag:        {TAG_LABEL} ({TAG_ID}){" [REMOVE]" if args.remove else ""}')
 print(f'Scanned:    {scanned} devices{"" if listing_complete else " (scan did not finish)"}')
