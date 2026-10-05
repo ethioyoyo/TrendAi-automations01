@@ -1,0 +1,4 @@
+# Third-party packages used by the scripts in this folder.
+# Everything else they import (argparse, csv, json, os, sys, time, datetime) is in the Python standard library.
+# Install with: pip install -r requirements.txt
+requests>=2.31,<3
