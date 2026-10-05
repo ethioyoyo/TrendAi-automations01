@@ -11,23 +11,31 @@ import requests
 # TAG_ID = "jU3ZsuQekszxvCkHQiV7l9i9jSzq-01"  # windows11 tag (now chosen from a menu at startup)
 CSV_FILE = "devices.csv"  # Default input file, override with --csv
 DEVICE_PAGE_SIZE = 1000  # Devices per page when listing attackSurfaceDevices
-TAG_BATCH_SIZE = 1000  # Max mappings per tag assign request
+TAG_BATCH_SIZE = 1000  # Max mappings per tag assign/unassign request
 MAX_RETRIES = 6  # Retries for 429 / 5xx / network errors before giving up
 OUTPUT_ROOT = "output"  # Each run writes its result files to output/<timestamp>/
 
 url_base = 'https://api.xdr.trendmicro.com'
 device_api_path = '/v3.0/asrm/attackSurfaceDevices'
-tag_api_path = '/v3.0/tagManagement/customTags/assign'
+tag_assign_api_path = '/v3.0/tagManagement/customTags/assign'
+tag_unassign_api_path = '/v3.0/tagManagement/customTags/unassign'
 tag_list_api_path = '/v3.0/tagManagement/customTags'
 
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 HEADER_NAMES = {'devicename', 'device name', 'name', 'hostname', 'device'}
 
-parser = argparse.ArgumentParser(description='Assign a Vision One custom tag to devices listed in a CSV file.')
+parser = argparse.ArgumentParser(description='Assign (or remove) a Vision One custom tag for devices listed in a CSV file.')
 parser.add_argument('--csv', default=CSV_FILE, help=f'file of device names, one per line (default: {CSV_FILE})')
-parser.add_argument('--dry-run', action='store_true', help='match devices and write result files, but do not assign the tag')
+parser.add_argument('--remove', action='store_true', help='remove the selected tag from the listed devices instead of assigning it')
+parser.add_argument('--dry-run', action='store_true', help='match devices and write result files, but do not change any tags')
 parser.add_argument('--limit', type=int, help='only use the first N names from the CSV (for testing on a sample)')
 args = parser.parse_args()
+
+# Everything that differs between assigning and removing
+tag_api_path = tag_unassign_api_path if args.remove else tag_assign_api_path
+ACTION = 'remove' if args.remove else 'assign'
+DONE_FILE = 'untagged.csv' if args.remove else 'tagged.csv'
+RERUN = 'python3 batch-tagging.py' + (' --remove' if args.remove else '')
 
 token = os.environ.get('TMV1_TOKEN')
 if not token:
@@ -128,7 +136,10 @@ if not tags:
 selected_tag = select_tag(tags)
 TAG_ID = selected_tag['id']
 TAG_LABEL = f'{selected_tag.get("property", "")}: {selected_tag.get("value", "")}'
-print(f'Selected tag: {TAG_LABEL} ({TAG_ID})\n')
+print(f'Selected tag: {TAG_LABEL} ({TAG_ID})')
+if args.remove:
+    print('MODE: REMOVE. The tag will be removed from the listed devices.')
+print()
 
 # Step 1: Read device names from CSV file (first column; header row and duplicates skipped)
 print(f'Reading device names from {args.csv}...')
@@ -150,9 +161,16 @@ if args.limit:
 if not names_to_tag:
     sys.exit('No device names found in the CSV file')
 
-print(f'Found {len(names_to_tag)} unique device names to tag')
+print(f'Found {len(names_to_tag)} unique device names')
 if args.dry_run:
-    print('DRY RUN: devices will be matched but the tag will NOT be assigned')
+    print(f'DRY RUN: devices will be matched but the tag will NOT be {"removed" if args.remove else "assigned"}')
+elif args.remove:
+    try:
+        answer = input(f'Remove "{TAG_LABEL}" from up to {len(names_to_tag)} devices? Type yes to continue: ')
+    except (EOFError, KeyboardInterrupt):
+        sys.exit('\nCancelled')
+    if answer.strip().lower() != 'yes':
+        sys.exit('Cancelled')
 
 run_dir = os.path.join(OUTPUT_ROOT, datetime.now().strftime('%Y%m%d-%H%M%S'))
 os.makedirs(run_dir, exist_ok=True)
@@ -172,7 +190,7 @@ interrupted = False
 
 
 def flush_batch():
-    """Assign the tag to everything in `pending` in one request"""
+    """Assign (or remove) the tag for everything in `pending` in one request"""
     global batch_count
     if not pending:
         return
@@ -214,7 +232,7 @@ def flush_batch():
 
 
 # Step 2: List all devices once and match locally, tagging each full batch as it fills
-print('Scanning devices and assigning the tag as matches are found...')
+print(f'Scanning devices and {"removing" if args.remove else "assigning"} the tag as matches are found...')
 start = time.time()
 scanned = 0
 url = url_base + device_api_path
@@ -259,7 +277,7 @@ finally:
 # Step 3: Write result files
 unmatched = [names_to_tag[k] for k in names_to_tag if k not in matched_names]
 write_csv(os.path.join(run_dir, 'matched.csv'), ['csvName', 'deviceName', 'assetId'], matched)
-write_csv(os.path.join(run_dir, 'tagged.csv'), ['csvName', 'deviceName', 'assetId', 'batch', 'status'], tagged)
+write_csv(os.path.join(run_dir, DONE_FILE), ['csvName', 'deviceName', 'assetId', 'batch', 'status'], tagged)
 if tag_errors:
     write_csv(os.path.join(run_dir, 'tag_errors.csv'), ['csvName', 'deviceName', 'assetId', 'error'], tag_errors)
 if operations:
@@ -277,11 +295,13 @@ if tag_errors:
 # Summary
 duplicates = len(matched) - len(matched_names)
 print(f'\n{"="*60}')
-print(f'Tag:        {TAG_LABEL} ({TAG_ID})')
+print(f'Tag:        {TAG_LABEL} ({TAG_ID}){" [REMOVE]" if args.remove else ""}')
 print(f'Scanned:    {scanned} devices{"" if listing_complete else " (scan did not finish)"}')
 print(f'Matched:    {len(matched_names)}/{len(names_to_tag)} names, {len(matched)} devices'
       + (f' ({duplicates} extra devices share a name)' if duplicates else ''))
-print(f'{"Would tag:" if args.dry_run else "Tagged:":<11} {len(tagged)} devices in {batch_count} batches')
+done_label = {('assign', False): 'Tagged:', ('assign', True): 'Would tag:',
+              ('remove', False): 'Untagged:', ('remove', True): 'Would untag:'}[(ACTION, args.dry_run)]
+print(f'{done_label:<11} {len(tagged)} devices in {batch_count} batches → {DONE_FILE}')
 if tag_errors:
     print(f'Failed:     {len(tag_errors)} devices → retry.csv, tag_errors.csv')
 if unmatched:
@@ -292,9 +312,9 @@ print(f'{"="*60}')
 
 if not listing_complete:
     print('\nThe device scan did not finish, so some names were never checked.')
-    print(f'Re-run them with:  python3 batch-tagging.py --csv {os.path.join(run_dir, unmatched_file)}')
+    print(f'Re-run them with:  {RERUN} --csv {os.path.join(run_dir, unmatched_file)}')
 if tag_errors:
-    print(f'\nRe-run failed tag batches with:  python3 batch-tagging.py --csv {os.path.join(run_dir, "retry.csv")}')
+    print(f'\nRe-run failed tag batches with:  {RERUN} --csv {os.path.join(run_dir, "retry.csv")}')
 
 if interrupted or listing_error or tag_errors:
     sys.exit(1)
